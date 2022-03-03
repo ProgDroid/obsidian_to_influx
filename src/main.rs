@@ -231,7 +231,7 @@ async fn add_notes_data(config: Config, client: Client, starting_date: Date<Utc>
         }
     }
 
-    println!("Finished!");
+    println!("Finished...");
 
     exitcode::OK
 }
