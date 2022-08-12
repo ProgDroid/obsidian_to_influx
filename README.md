@@ -17,6 +17,7 @@ Therefore, setting up a cron job to start the container (e.g. once a day) is the
 #### Env Variables
 
 | Variable | Description |
+|----------|-------------|
 | `DB_HOST` | InfluxDB host |
 | `DB_PORT` | InfluxDB port |
 | `DB_NAME` | InfluxDB database name |
