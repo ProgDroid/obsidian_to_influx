@@ -1,12 +1,14 @@
-use chrono::naive::{NaiveDate, NaiveTime};
-use chrono::{Date, DateTime, Datelike, Utc};
-use influxdb::integrations::serde_integration::Return;
-use influxdb::{Client, InfluxDbWriteable, ReadQuery};
+use std::{env, fs, path::PathBuf, time::UNIX_EPOCH};
+
+use anyhow::{anyhow, Context, Error};
+use chrono::{
+    naive::{NaiveDate, NaiveTime},
+    DateTime, Datelike, Utc,
+};
+use influxdb::{Client, InfluxDbWriteable, ReadQuery, WriteQuery};
+use rayon::prelude::*;
 use serde::Deserialize;
-use std::env;
-use std::fs;
-use std::path::PathBuf;
-use std::time::UNIX_EPOCH;
+use walkdir::{DirEntry, WalkDir};
 use yaml_front_matter::YamlFrontMatter;
 
 const DB_HOST_VAR_HANDLE: &str = "DB_HOST";
@@ -14,6 +16,8 @@ const DB_NAME_VAR_HANDLE: &str = "DB_NAME";
 const DB_PORT_VAR_HANDLE: &str = "DB_PORT";
 const NOTES_DIR_VAR_HANDLE: &str = "NOTES_DIR";
 const VAULT_PATH_VAR_HANDLE: &str = "VAULT_PATH";
+const NOTE_FILE_EXTENSION: &str = ".md";
+const DATE_FORMAT: &str = "%Y-%m-%d";
 
 struct Config {
     db_host: String,
@@ -31,9 +35,8 @@ struct Frontmatter {
 
 #[derive(Debug)]
 struct Note {
-    path: PathBuf,
     frontmatter: Frontmatter,
-    date: Date<Utc>,
+    date: NaiveDate,
 }
 
 #[derive(Debug, Deserialize, InfluxDbWriteable)]
@@ -46,16 +49,8 @@ struct DbEntry {
     value: u8,
 }
 
-fn get_env_var(handle: &str) -> String {
-    println!("Getting env var {}", handle);
-
-    match env::var(handle) {
-        Ok(val) => val,
-        Err(e) => {
-            println!("Could not get env var {}: {}", handle, e);
-            std::process::exit(exitcode::CONFIG)
-        }
-    }
+fn get_env_var(handle: &str) -> Result<String, Error> {
+    env::var(handle).context(format!("Could not get env var {handle}"))
 }
 
 fn build_vault_path(path: &str, dir: &str) -> PathBuf {
@@ -68,14 +63,21 @@ fn build_vault_path(path: &str, dir: &str) -> PathBuf {
     notes_path
 }
 
-fn get_starting_date_from_query_result(db_entry: Return<DbEntry>) -> DateTime<Utc> {
-    match db_entry.series.iter().next() {
-        None => UNIX_EPOCH.into(),
-        Some(series) => match series.values.iter().next() {
-            Some(db_entry) => db_entry.time,
-            None => UNIX_EPOCH.into(),
-        },
-    }
+async fn get_date_from_query(
+    client: &Client,
+    read_query: ReadQuery,
+) -> Result<DateTime<Utc>, Error> {
+    let mut db_result = client.json_query(read_query).await?;
+
+    Ok(db_result
+        .deserialize_next::<DbEntry>()?
+        .series
+        .first()
+        .context("No elements in series")?
+        .values
+        .first()
+        .context("No values in first element of series")?
+        .time)
 }
 
 async fn get_starting_date(client: &Client, config: &Config) -> DateTime<Utc> {
@@ -86,174 +88,152 @@ async fn get_starting_date(client: &Client, config: &Config) -> DateTime<Utc> {
         &config.db_name
     ));
 
-    match client
-        .json_query(read_query)
-        .await
-        .and_then(|mut db_result| db_result.deserialize_next::<DbEntry>())
-    {
-        Ok(read_result) => get_starting_date_from_query_result(read_result),
-        Err(_) => UNIX_EPOCH.into(),
+    (get_date_from_query(client, read_query).await).map_or_else(
+        |e| {
+            println!("Could not get date from latest entry: {e}");
+            UNIX_EPOCH.into()
+        },
+        |val| val,
+    )
+}
+
+fn note_from_path(path: &str, date: NaiveDate) -> Option<Note> {
+    let file_contents: String = fs::read_to_string(path).ok()?;
+
+    let frontmatter: Frontmatter = YamlFrontMatter::parse::<Frontmatter>(file_contents.as_str())
+        .ok()?
+        .metadata;
+
+    Some(Note { frontmatter, date })
+}
+
+fn parse_file_to_note(entry: &DirEntry, starting_date: NaiveDate) -> Option<Note> {
+    let entry_path = entry.path().to_str()?;
+
+    let file_date: NaiveDate = NaiveDate::parse_from_str(entry_path, DATE_FORMAT).ok()?;
+
+    let yesterday = Utc::now().date_naive().pred_opt()?;
+
+    if file_date > starting_date && file_date <= yesterday {
+        note_from_path(entry_path, file_date)
+    } else {
+        None
     }
 }
 
-fn date_from_file_name(file_name: String) -> Result<Date<Utc>, &'static str> {
-    let naive_date: NaiveDate = match NaiveDate::parse_from_str(&file_name, "%Y-%m-%d") {
-        Ok(value) => value,
-        Err(_) => {
-            eprintln!("{}", &file_name);
-            return Err("Could not parse date from file name");
-        }
-    };
-
-    Ok(Date::<Utc>::from_utc(naive_date, Utc))
+fn is_hidden(entry: &DirEntry) -> bool {
+    entry
+        .file_name()
+        .to_str()
+        .map_or(false, |s| s.starts_with('.'))
 }
 
-fn note_from_path(path: &PathBuf, date: Date<Utc>) -> Result<Note, &'static str> {
-    let file_contents: String = match fs::read_to_string(path.as_path()) {
-        Ok(value) => value,
-        Err(_) => return Err("Could not read file contents"),
-    };
-
-    let frontmatter: Frontmatter =
-        match YamlFrontMatter::parse::<Frontmatter>(file_contents.as_str()) {
-            Ok(value) => value.metadata,
-            Err(_) => return Err("Could not get frontmatter from note"),
-        };
-
-    Ok(Note {
-        path: path.to_path_buf(),
-        frontmatter: frontmatter,
-        date: date,
-    })
-}
-
-fn get_notes_from_dir(path: PathBuf, starting_date: Date<Utc>) -> Vec<Note> {
+fn get_sorted_notes_from_dir(path: PathBuf, starting_date: NaiveDate) -> Vec<Note> {
     println!("Getting notes from dir {:?}", path.as_os_str());
 
-    let entries = match fs::read_dir(path) {
-        Ok(value) => value,
-        Err(e) => {
-            eprintln!("Could not read directory: {}", e);
-            return Vec::new();
-        }
-    };
+    let mut notes = WalkDir::new(path)
+        .into_iter()
+        .filter_entry(|e| {
+            !is_hidden(e)
+                && e.file_name()
+                    .to_str()
+                    .map_or(false, |s| s.ends_with(NOTE_FILE_EXTENSION))
+        })
+        .par_bridge()
+        .filter_map(Result::ok)
+        .filter_map(|e| parse_file_to_note(&e, starting_date))
+        .collect::<Vec<Note>>();
 
-    let mut notes: Vec<Note> = Vec::new();
-
-    for entry in entries {
-        let entry_path: PathBuf = entry.unwrap().path();
-
-        if entry_path.as_path().is_dir() {
-            notes.append(&mut get_notes_from_dir(entry_path, starting_date));
-            continue;
-        }
-
-        let file_name: String = match entry_path.file_stem() {
-            Some(value) => match value.to_os_string().into_string() {
-                Ok(value) => value,
-                Err(e) => {
-                    eprintln!("Could not get file name: {:?}", e);
-                    continue;
-                }
-            },
-            None => continue,
-        };
-
-        let file_date: Date<Utc> = match date_from_file_name(file_name) {
-            Ok(date) => date,
-            Err(e) => {
-                eprintln!("Could not get date from file name: {}", e);
-                continue;
-            }
-        };
-
-        let yesterday: Date<Utc> = match Utc::today().pred_opt() {
-            Some(value) => value,
-            None => {
-                eprintln!("Could not get yesterday's date!");
-                continue;
-            }
-        };
-
-        if file_date > starting_date && file_date <= yesterday {
-            match note_from_path(&entry_path, file_date) {
-                Ok(note) => notes.push(note),
-                Err(e) => eprintln!(
-                    "Error getting note from path {}: {}",
-                    entry_path.display(),
-                    e
-                ),
-            };
-        }
-    }
+    notes.sort_by(|a, b| a.date.cmp(&b.date));
 
     notes
 }
 
-async fn add_notes_data(config: Config, client: Client, starting_date: Date<Utc>) -> i32 {
+async fn push_notes_data(config: Config, client: Client) -> Result<(), Error> {
+    let starting_date: NaiveDate = get_starting_date(&client, &config).await.date_naive();
+
+    println!("Using {starting_date} as starting point...");
+
     println!("Adding notes...");
 
     let notes_path: PathBuf =
         build_vault_path(config.vault_path.as_str(), config.notes_dir.as_str());
 
-    let mut notes: Vec<Note> = get_notes_from_dir(notes_path, starting_date);
+    let notes: Vec<Note> = get_sorted_notes_from_dir(notes_path, starting_date);
 
-    notes.sort_by(|a, b| a.date.cmp(&b.date));
-
-    let notes: Vec<Note> = notes;
-
-    for note in notes {
-        let mut count: u32 = 0u32;
-
-        for tag in &note.frontmatter.tags {
-            if tag.contains("#") {
-                let entry: DbEntry = DbEntry {
-                    time: note
-                        .date
-                        .and_time(NaiveTime::from_num_seconds_from_midnight(0, count))
-                        .unwrap(),
-                    weekday: note.date.weekday().to_string(),
-                    frontmatter_tag: tag.to_string(),
-                    value: 1,
-                };
-
-                count += 1;
-
-                match client.query(entry.into_query(&config.db_name)).await {
-                    Ok(_) => println!(
-                        "Note {:?}, tag {} pushed into InfluxDB",
-                        note.path.file_stem().unwrap(),
-                        tag
-                    ),
-                    Err(e) => eprintln!("Could not push to InfluxDB: {}", e),
-                };
-            }
-        }
+    if notes.is_empty() {
+        println!("No notes were found");
+        return Ok(());
     }
 
-    println!("Finished...");
+    let db_name = config.db_name.as_str();
 
-    exitcode::OK
+    let inserts: Vec<WriteQuery> = notes
+        .into_iter()
+        .flat_map(|note| {
+            let note_time = note.date;
+            let weekday = note.date.weekday();
+
+            note.frontmatter
+                .tags
+                .into_iter()
+                .enumerate()
+                .filter(|(_, tag)| tag.contains('#'))
+                .map(move |(index, tag)| {
+                    let entry: WriteQuery = DbEntry {
+                        time: note_time
+                            .and_time(
+                                NaiveTime::from_num_seconds_from_midnight_opt(
+                                    0,
+                                    std::convert::TryInto::try_into(index).unwrap(),
+                                )
+                                .unwrap(),
+                            )
+                            .and_utc(),
+                        weekday: weekday.to_string(),
+                        frontmatter_tag: tag,
+                        value: 1,
+                    }
+                    .into_query(db_name);
+
+                    entry
+                })
+        })
+        .collect();
+
+    if inserts.is_empty() {
+        return Err(anyhow!(
+            "Notes were found, but no insert queries were generated"
+        ));
+    }
+
+    let _res = client.query(inserts).await?;
+
+    println!("Finished!");
+
+    Ok(())
 }
 
 #[tokio::main]
-async fn main() {
+async fn main() -> Result<(), Error> {
+    println!("Configuring...");
+
     let config = Config {
-        db_host: get_env_var(DB_HOST_VAR_HANDLE),
-        db_name: get_env_var(DB_NAME_VAR_HANDLE),
-        db_port: get_env_var(DB_PORT_VAR_HANDLE),
-        notes_dir: get_env_var(NOTES_DIR_VAR_HANDLE),
-        vault_path: get_env_var(VAULT_PATH_VAR_HANDLE),
+        db_host: get_env_var(DB_HOST_VAR_HANDLE)?,
+        db_name: get_env_var(DB_NAME_VAR_HANDLE)?,
+        db_port: get_env_var(DB_PORT_VAR_HANDLE)?,
+        notes_dir: get_env_var(NOTES_DIR_VAR_HANDLE)?,
+        vault_path: get_env_var(VAULT_PATH_VAR_HANDLE)?,
     };
+
+    println!("Configuration loaded!");
 
     let client: Client = Client::new(
         format!("http://{}:{}", &config.db_host, &config.db_port),
         &config.db_name,
     );
 
-    let starting_date: Date<Utc> = get_starting_date(&client, &config).await.date();
+    println!("Configuration done!");
 
-    println!("Using {} as starting point", starting_date);
-
-    std::process::exit(add_notes_data(config, client, starting_date).await);
+    push_notes_data(config, client).await
 }

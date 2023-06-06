@@ -1,14 +1,16 @@
 [package]
 name = "obsidian_to_influx"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2018"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-exitcode = "1.1.2"
-influxdb = { version = "0.5.1", features = ["derive"] }
+anyhow = "1"
+chrono = "0.4"
+influxdb = { version = "0.6", features = ["derive"] }
+rayon = "1.7"
 serde = { version = "1.0", features = ["derive"] }
-yaml-front-matter = "0.1.0"
-chrono = "0.4.19"
 tokio = { version = "1", features = ["full"] }
+walkdir = "2.3"
+yaml-front-matter = "0.1.0"
