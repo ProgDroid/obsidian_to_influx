@@ -107,12 +107,15 @@ fn note_from_path(path: &str, date: NaiveDate) -> Option<Note> {
     Some(Note { frontmatter, date })
 }
 
-fn parse_file_to_note(entry: &DirEntry, starting_date: NaiveDate) -> Option<Note> {
+fn parse_file_to_note(
+    entry: &DirEntry,
+    starting_date: NaiveDate,
+    yesterday: NaiveDate,
+) -> Option<Note> {
+    let file_name = entry.path().file_stem()?.to_str()?;
     let entry_path = entry.path().to_str()?;
 
-    let file_date: NaiveDate = NaiveDate::parse_from_str(entry_path, DATE_FORMAT).ok()?;
-
-    let yesterday = Utc::now().date_naive().pred_opt()?;
+    let file_date: NaiveDate = NaiveDate::parse_from_str(file_name, DATE_FORMAT).ok()?;
 
     if file_date > starting_date && file_date <= yesterday {
         note_from_path(entry_path, file_date)
@@ -128,20 +131,24 @@ fn is_hidden(entry: &DirEntry) -> bool {
         .map_or(false, |s| s.starts_with('.'))
 }
 
-fn get_sorted_notes_from_dir(path: PathBuf, starting_date: NaiveDate) -> Vec<Note> {
+fn get_sorted_notes_from_dir(
+    path: PathBuf,
+    starting_date: NaiveDate,
+    yesterday: NaiveDate,
+) -> Vec<Note> {
     println!("Getting notes from dir {:?}", path.as_os_str());
 
     let mut notes = WalkDir::new(path)
         .into_iter()
-        .filter_entry(|e| {
-            !is_hidden(e)
-                && e.file_name()
-                    .to_str()
-                    .map_or(false, |s| s.ends_with(NOTE_FILE_EXTENSION))
-        })
+        .filter_entry(|e| !is_hidden(e))
         .par_bridge()
         .filter_map(Result::ok)
-        .filter_map(|e| parse_file_to_note(&e, starting_date))
+        .filter(|e| {
+            e.file_name()
+                .to_str()
+                .map_or(false, |s| s.ends_with(NOTE_FILE_EXTENSION))
+        })
+        .filter_map(|e| parse_file_to_note(&e, starting_date, yesterday))
         .collect::<Vec<Note>>();
 
     notes.sort_by(|a, b| a.date.cmp(&b.date));
@@ -152,6 +159,11 @@ fn get_sorted_notes_from_dir(path: PathBuf, starting_date: NaiveDate) -> Vec<Not
 async fn push_notes_data(config: Config, client: Client) -> Result<(), Error> {
     let starting_date: NaiveDate = get_starting_date(&client, &config).await.date_naive();
 
+    let yesterday = Utc::now()
+        .date_naive()
+        .pred_opt()
+        .context("Could not get date for yesterday")?;
+
     println!("Using {starting_date} as starting point...");
 
     println!("Adding notes...");
@@ -159,7 +171,7 @@ async fn push_notes_data(config: Config, client: Client) -> Result<(), Error> {
     let notes_path: PathBuf =
         build_vault_path(config.vault_path.as_str(), config.notes_dir.as_str());
 
-    let notes: Vec<Note> = get_sorted_notes_from_dir(notes_path, starting_date);
+    let notes: Vec<Note> = get_sorted_notes_from_dir(notes_path, starting_date, yesterday);
 
     if notes.is_empty() {
         println!("No notes were found");
@@ -178,7 +190,7 @@ async fn push_notes_data(config: Config, client: Client) -> Result<(), Error> {
                 .tags
                 .into_iter()
                 .enumerate()
-                .filter(|(_, tag)| tag.contains('#'))
+                .filter(|(_, tag)| tag.starts_with('#'))
                 .map(move |(index, tag)| {
                     let entry: WriteQuery = DbEntry {
                         time: note_time
@@ -191,7 +203,7 @@ async fn push_notes_data(config: Config, client: Client) -> Result<(), Error> {
                             )
                             .and_utc(),
                         weekday: weekday.to_string(),
-                        frontmatter_tag: tag,
+                        frontmatter_tag: tag[1..].to_string(),
                         value: 1,
                     }
                     .into_query(db_name);
